@@ -7,6 +7,7 @@
 pragma solidity 0.8.20;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "./interfaces/ILendingInterfaces.sol";
 import "./Registry.sol";
 
@@ -35,6 +36,7 @@ contract HybridPriceOracle is IPriceOracle, Ownable {
         uint256 lastUpdate;      // Last update timestamp
         uint256 volume24h;       // Rolling 24h volume
         uint256 lastVolumeReset; // Last time volume was reset
+        uint256 initTime;        // When price was initialized (for bootstrap period)
         bool initialized;        // Whether price has been set
     }
     
@@ -55,6 +57,12 @@ contract HybridPriceOracle is IPriceOracle, Ownable {
     
     // Price deviation limits (CRITICAL SECURITY FIX)
     uint256 public constant MAX_PRICE_DEVIATION_BPS = 2000; // 20% max deviation per update
+
+    // Bootstrap period: first 24h after initialization, no deviation clamp and faster EMA
+    // This allows new tokens to converge to market price quickly without getting stuck
+    uint256 public constant BOOTSTRAP_PERIOD = 24 hours;
+    uint256 public constant BOOTSTRAP_MIN_ALPHA = 2e17; // 20% min alpha during bootstrap (ensures convergence)
+    uint256 public constant BOOTSTRAP_MAX_ALPHA = 5e17; // 50% max alpha during bootstrap (vs ~2% normal)
 
     // Configurable timing parameters (set via setDecayConfig in multisig deployment)
     // Test defaults allow fast iteration; production values set post-deployment
@@ -194,31 +202,64 @@ contract HybridPriceOracle is IPriceOracle, Ownable {
         TokenConfig memory config
     ) internal {
         VWAPData storage data = vwapData[asset];
-        
+
+        // Always accumulate 24h volume (even if price update is skipped)
+        if (block.timestamp >= data.lastVolumeReset + 24 hours) {
+            data.volume24h = volumeWad;
+            data.lastVolumeReset = block.timestamp;
+        } else {
+            data.volume24h += volumeWad;
+        }
+
         if (!data.initialized) {
             // First price update: Accept any volume to initialize
             data.price = scaledPrice;
             data.initialized = true;
-            data.lastVolumeReset = block.timestamp;
-        } else {
-            // SECURITY FIX: Enforce minimum time between updates (prevents rapid manipulation)
-            require(block.timestamp >= data.lastUpdate + MIN_UPDATE_INTERVAL, "Update too frequent");
-            
-            // CRITICAL FIX (L-2): Guard against division by zero
-            if (data.price == 0) {
-                data.price = scaledPrice;
-                data.lastUpdate = block.timestamp;
-                return;
+            data.initTime = block.timestamp;
+            data.lastUpdate = block.timestamp;
+            return;
+        }
+
+        // SECURITY: Skip price update if too frequent (prevents rapid manipulation)
+        // Volume has already been accumulated above — only price update is rate-limited
+        if (block.timestamp < data.lastUpdate + MIN_UPDATE_INTERVAL) {
+            return;
+        }
+
+        // CRITICAL FIX (L-2): Guard against division by zero
+        if (data.price == 0) {
+            data.price = scaledPrice;
+            data.lastUpdate = block.timestamp;
+            return;
+        }
+
+        // Check if in bootstrap period (first 24h after initialization)
+        bool inBootstrap = block.timestamp - data.initTime < BOOTSTRAP_PERIOD;
+
+        if (inBootstrap) {
+            // BOOTSTRAP: No deviation clamp — let EMA converge to market price freely
+            // This prevents the "stuck EMA" death spiral for new tokens trading far from mint price
+            consecutiveRejections[asset] = 0;
+
+            // Only update price if volume is significant
+            if (volumeWad >= config.minUpdateVolume) {
+                // Use higher alpha during bootstrap for faster convergence
+                uint256 alpha = (volumeWad * ONE) / (volumeWad + config.targetVolume);
+                // Enforce minimum alpha during bootstrap (ensures convergence even for small trades)
+                if (alpha < BOOTSTRAP_MIN_ALPHA) alpha = BOOTSTRAP_MIN_ALPHA;
+                if (alpha > BOOTSTRAP_MAX_ALPHA) alpha = BOOTSTRAP_MAX_ALPHA;
+
+                uint256 newWeight = scaledPrice * alpha / ONE;
+                uint256 oldWeight = data.price * (ONE - alpha) / ONE;
+                data.price = newWeight + oldWeight;
             }
-            
-            // CRITICAL: Check price deviation — clamp instead of reject
-            // This prevents the "death spiral" where rejected trades freeze lastUpdate,
-            // causing permanent staleness and RED risk tier. Clamping allows the EMA to
-            // converge gradually toward market price (like exchange price limits).
+        } else {
+            // NORMAL: Check price deviation — clamp instead of reject
+            // This prevents manipulation while allowing gradual convergence
             uint256 deviation = scaledPrice > data.price ?
                 ((scaledPrice - data.price) * 10000) / data.price :
                 ((data.price - scaledPrice) * 10000) / data.price;
-            
+
             if (deviation > MAX_PRICE_DEVIATION_BPS) {
                 // Clamp trade price to ±20% boundary of current EMA
                 uint256 originalPrice = scaledPrice;
@@ -233,28 +274,20 @@ contract HybridPriceOracle is IPriceOracle, Ownable {
                 // Normal update within deviation bounds — reset rejection counter
                 consecutiveRejections[asset] = 0;
             }
-            
+
             // Only update price if volume is significant
             if (volumeWad >= config.minUpdateVolume) {
                 // Calculate dynamic alpha based on volume
                 uint256 alpha = (volumeWad * ONE) / (volumeWad + config.targetVolume);
-                
+
                 // VWAP EMA: newPrice = alpha * tradePrice + (1 - alpha) * currentPrice
                 uint256 newWeight = scaledPrice * alpha / ONE;
                 uint256 oldWeight = data.price * (ONE - alpha) / ONE;
                 data.price = newWeight + oldWeight;
             }
         }
-        
+
         data.lastUpdate = block.timestamp;
-        
-        // Update 24h volume
-        if (block.timestamp >= data.lastVolumeReset + 24 hours) {
-            data.volume24h = volumeWad;
-            data.lastVolumeReset = block.timestamp;
-        } else {
-            data.volume24h += volumeWad;
-        }
     }
     
     
@@ -336,10 +369,12 @@ contract HybridPriceOracle is IPriceOracle, Ownable {
     
     /**
      * @notice Manually set price (admin only, for initialization or emergency)
+     * @dev Also resets consecutiveRejections counter to unstick wedged tokens
      * @param asset Token address
      * @param priceWad Price in 1e18 format
      */
     function setPrice(address asset, uint256 priceWad) external onlyOwner {
+        require(priceWad > 0, "Price must be > 0");
         VWAPData storage data = vwapData[asset];
         data.price = priceWad;
         data.lastUpdate = block.timestamp;
@@ -347,27 +382,67 @@ contract HybridPriceOracle is IPriceOracle, Ownable {
         if (data.lastVolumeReset == 0) {
             data.lastVolumeReset = block.timestamp;
         }
+        if (data.initTime == 0) {
+            data.initTime = block.timestamp;
+        }
+        // Reset rejection counter — admin override to unstick wedged tokens
+        consecutiveRejections[asset] = 0;
         
         emit PriceUpdated(asset, priceWad, 0);
+    }
+
+    /**
+     * @notice Set price, volume, and reset rejections in one call (admin only, for migration/re-seeding)
+     * @dev Used when migrating to a new oracle instance or re-seeding after configuration changes
+     * @param asset Token address
+     * @param priceWad Price in 1e18 format
+     * @param volume24h Initial 24h volume in USDC (6 decimals)
+     */
+    function setPriceWithVolume(address asset, uint256 priceWad, uint256 volume24h) external onlyOwner {
+        require(priceWad > 0, "Price must be > 0");
+        VWAPData storage data = vwapData[asset];
+        data.price = priceWad;
+        data.lastUpdate = block.timestamp;
+        data.volume24h = volume24h;
+        data.lastVolumeReset = block.timestamp;
+        data.initTime = block.timestamp; // Enable bootstrap for migrated tokens (allows EMA convergence)
+        data.initialized = true;
+        consecutiveRejections[asset] = 0;
+        
+        emit PriceUpdated(asset, priceWad, volume24h);
     }
     
     /**
      * @notice Initialize price at campaign success (called by LendingManager)
-     * @dev Sets initial price to 1 USDC with campaign mint volume for proper VWAP baseline
+     * @dev Computes initial price from campaign data (totalRaised / totalSupply) instead of
+     *      hardcoding $1.00. Falls back to $1.00 if campaign data is unavailable.
+     *      Sets initTime for bootstrap period tracking.
      * @param asset Token address
      * @param initialVolume Campaign total raised (mint volume in USDC, 6 decimals)
      */
     function initializePrice(address asset, uint256 initialVolume) external onlyAuthorized {
         require(!vwapData[asset].initialized, "Price already initialized");
         
-        // Initialize at 1 USDC (1e18 in WAD format)
-        uint256 initialPrice = ONE;
+        // Compute initial price from campaign data: totalRaised / totalSupply
+        // Both are in 6 decimals (USDC and MinimumERC20 tokens), so the ratio is dimensionless
+        // Scale to 1e18 WAD format for internal storage
+        uint256 initialPrice = ONE; // Default to $1.00
+        if (address(registry) != address(0)) {
+            Registry.CampaignData memory campaign = registry.getCampaign(asset);
+            if (campaign.totalRaised > 0) {
+                uint256 tokenSupply = IERC20(asset).totalSupply();
+                if (tokenSupply > 0) {
+                    initialPrice = (campaign.totalRaised * ONE) / tokenSupply;
+                }
+            }
+        }
         
         VWAPData storage data = vwapData[asset];
         data.price = initialPrice;
         data.lastUpdate = block.timestamp;
         data.volume24h = initialVolume;
         data.lastVolumeReset = block.timestamp;
+        data.initTime = block.timestamp;
         data.initialized = true;
         
         emit PriceInitialized(asset, initialPrice, initialVolume);
