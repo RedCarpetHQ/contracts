@@ -1,0 +1,14 @@
+# Compiler files
+cache/
+out/
+lib/
+node_modules/
+
+# Ignores development broadcast logs
+broadcast/
+
+# Dotenv file
+.env
+
+# macOS
+.DS_Store

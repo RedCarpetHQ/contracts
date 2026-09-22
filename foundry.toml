@@ -1,0 +1,48 @@
+[profile.default]
+src = 'src'
+out = 'out'
+libs = ['lib']
+solc = '0.8.20'
+via_ir = true
+evm_version = 'shanghai'
+ffi = true # Moved from [profile.test] - this is a global setting
+remappings = [
+    '@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/',
+    '@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/'
+]
+
+# Optimizer settings
+optimizer = true
+optimizer_runs = 1
+bytecode_hash = 'none'
+
+# Transaction delay to avoid RPC rate limiting (milliseconds)
+# BSC Testnet has strict limits on in-flight transactions
+delay = 3000  # 3 seconds between transactions
+
+# Filesystem permissions for vm.readFile / vm.writeFile
+fs_permissions = [{ access = "read-write", path = "./" }]
+
+# Yul details
+[profile.default.optimizer_details]
+yul = true
+constantOptimizer = true
+
+[profile.default.optimizer_details.yulDetails]
+stackAllocation = true
+
+# --- CORRECTED FUZZ SETTINGS ---
+# Instead of [profile.fuzz], we use [profile.default.fuzz]
+[profile.default.fuzz]
+runs = 10_000
+seed = '0x4444'
+
+# --- RPC ENDPOINTS ---
+[rpc_endpoints]
+robinhoodtestnet = "${ROBINHOOD_TESTNET_RPC_URL}"
+
+# --- FORMATTING ---
+[fmt]
+line_length = 120
+tab_width = 4
+bracket_spacing = true
